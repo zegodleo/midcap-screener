@@ -22,15 +22,14 @@ Coverage:
 from __future__ import annotations
 import pandas as pd
 
-# Factor -> (bucket, higher_is_better)
-# Buckets and weights:
+# Buckets and weights — FUNDAMENTALS-ONLY (price sources unavailable in 2026).
+# Valuation/Size/Liquidity needed live price; keyless price scraping is dead
+# (yfinance + Stooq both blocked). The remaining weights are renormalized to
+# sum to 1.0. Valuation is now a MANUAL step on your shortlist, not scored.
 BUCKET_WEIGHTS = {
-    "growth": 0.35,
-    "quality": 0.25,
-    "balance": 0.15,
-    "valuation": 0.10,
-    "size": 0.10,
-    "liquidity": 0.05,
+    "growth": 0.467,    # was 0.35  -> 0.35/0.75
+    "quality": 0.333,   # was 0.25  -> 0.25/0.75
+    "balance": 0.200,   # was 0.15  -> 0.15/0.75
 }
 
 # Each factor maps to a bucket and a direction.
@@ -45,15 +44,10 @@ FACTOR_SPEC = {
     "operating_margin":       ("quality", True),
     "operating_margin_trend": ("quality", True),
     "roe":                    ("quality", True),
+    "roic":                   ("quality", True),
     # balance sheet
     "debt_to_equity":         ("balance", False),   # lower is better
     "share_change":           ("balance", False),   # lower (less dilution) better
-    # valuation (price-dependent; added by enrichment)
-    "price_to_sales":         ("valuation", False), # lower is better
-    # size (price-dependent)
-    "market_cap":             ("size", True),       # bigger within the band
-    # liquidity (price-dependent)
-    "dollar_volume":          ("liquidity", True),
 }
 
 
