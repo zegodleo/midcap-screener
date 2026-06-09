@@ -149,6 +149,13 @@ def _margin_trend(margin_series: dict):
     return vals[-1] - vals[0]
 
 
+def _clamp_or_none(val, lo, hi):
+    """Return val if within [lo, hi], else None (treat out-of-range as missing)."""
+    if val is None:
+        return None
+    return val if lo <= val <= hi else None
+
+
 def extract_factors(facts: dict | None) -> dict:
     """
     Main entry point. Given CompanyFacts JSON (or None), return a flat dict of
@@ -165,6 +172,7 @@ def extract_factors(facts: dict | None) -> dict:
         "net_income_latest": None,
         "revenue_latest": None,
         "shares_latest": None,
+        "exclude_reason": None,
     }
     if not facts:
         return out
@@ -230,5 +238,33 @@ def extract_factors(facts: dict | None) -> dict:
     # Positive = dilution (more shares), negative = buybacks.
     out["share_change"] = _cagr(sh)  # CAGR of share count
     out["shares_latest"] = _latest(sh)  # for market-cap computation
+
+    # --- Data-quality guardrails -------------------------------------------
+    # 1) Negative book equity breaks ROIC and debt/equity and is ambiguous
+    #    (often heavy buybacks, sometimes distress). Per config, flag these
+    #    companies for exclusion from the screen entirely.
+    if eq_latest is not None and eq_latest < 0:
+        out["exclude_reason"] = "negative_equity"
+
+    # 2) Sanity-clamp ratios: a value outside a plausible range is almost
+    #    always a bad/anomalous filing, so treat it as missing rather than let
+    #    it distort the percentile rankings. (Drops out of coverage too.)
+    out["roic"] = _clamp_or_none(out["roic"], -0.50, 1.00)
+    out["roe"] = _clamp_or_none(out["roe"], -1.00, 1.00)
+    out["gross_margin"] = _clamp_or_none(out["gross_margin"], -1.00, 1.00)
+    out["operating_margin"] = _clamp_or_none(out["operating_margin"], -1.00, 1.00)
+    out["gross_margin_trend"] = _clamp_or_none(out["gross_margin_trend"], -1.00, 1.00)
+    out["operating_margin_trend"] = _clamp_or_none(out["operating_margin_trend"], -1.00, 1.00)
+    # debt/equity: negative means negative equity (handled above); cap the high
+    # end where it's a meaningless blow-up.
+    out["debt_to_equity"] = _clamp_or_none(out["debt_to_equity"], 0.0, 20.0)
+
+    # 3) Cap revenue growth: a recovery off a near-zero base (e.g. post-
+    #    bankruptcy) shows absurd CAGR that isn't real compounding. Cap the
+    #    contribution so these don't dominate the growth ranking.
+    if out["revenue_cagr"] is not None:
+        out["revenue_cagr"] = min(out["revenue_cagr"], 0.50)
+    if out["revenue_yoy"] is not None:
+        out["revenue_yoy"] = min(out["revenue_yoy"], 0.50)
 
     return out
