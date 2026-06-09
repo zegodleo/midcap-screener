@@ -4,7 +4,12 @@ name: Stock Screener
 on:
   schedule:
     - cron: "0 13 1 * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      skip_price:
+        description: "Skip yfinance price step (run on fundamentals only)"
+        type: boolean
+        default: false
 
 jobs:
   screen:
@@ -19,12 +24,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Build universe (Phase 1)
+      - name: Run screener (Phase 2)
         env:
           # Set this in: repo Settings -> Secrets and variables -> Actions
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
           OUTPUT_DIR: output
-        run: python universe.py
+          TOP_N: "50"
+          # Manual runs can flip this on if Yahoo is blocking the runner.
+          SKIP_PRICE: ${{ inputs.skip_price && '1' || '' }}
+        # NOTE: files live at the repo root in your setup, so call screen.py
+        # directly. (If you later move them into a screener/ folder, change
+        # this to: python screener/screen.py)
+        run: python screen.py
 
       - name: Commit results
         run: |
