@@ -41,6 +41,16 @@ def run() -> pd.DataFrame:
     # --- Phase 1: universe ---
     uni = build_universe(client)
     universe = uni.df[uni.df["cik"].notna()].copy()
+
+    # Exclude sectors that don't fit a growth-compounder model. Banks have no
+    # gross margin and REITs are valued on NAV/book, not revenue growth and
+    # margins — scoring them on this rubric is meaningless. They need a
+    # separate scorecard, so we leave them out of this screen entirely.
+    EXCLUDED_SECTORS = {"Financials", "Real Estate"}
+    before = len(universe)
+    universe = universe[~universe["sector"].isin(EXCLUDED_SECTORS)].copy()
+    log.info("Excluded %d Financials/Real Estate; %d companies remain.",
+             before - len(universe), len(universe))
     log.info("Scoring %d companies with CIKs.", len(universe))
 
     # --- Phase 2a: per-company EDGAR factors ---
@@ -67,7 +77,7 @@ def run() -> pd.DataFrame:
             r.setdefault("price_to_sales", None)
             r.setdefault("dollar_volume", None)
     else:
-        log.info("Enriching with price (yfinance, best-effort)...")
+        log.info("Enriching with price (Stooq)...")
         rows = enrich_with_price(rows)
 
     # --- Phase 2c: score & rank ---
@@ -78,7 +88,7 @@ def run() -> pd.DataFrame:
              "sufficient_data", "coverage", "coverage_max", "weight_coverage"]
     factor_cols = ["revenue_cagr", "revenue_yoy", "revenue_years",
                    "gross_margin", "gross_margin_trend",
-                   "operating_margin", "operating_margin_trend", "roe",
+                   "operating_margin", "operating_margin_trend", "roe", "roic",
                    "debt_to_equity", "share_change",
                    "price_to_sales", "market_cap", "dollar_volume"]
     front += [c for c in factor_cols if c in df.columns]
