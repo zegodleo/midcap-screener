@@ -26,6 +26,10 @@ TAG_SYNONYMS = {
         "Revenues",
         "SalesRevenueNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "RevenuesNetOfInterestExpense",
+        "SalesRevenueGoodsNet",
+        "SalesRevenueServicesNet",
+        "RegulatedAndUnregulatedOperatingRevenue",
     ],
     "gross_profit": ["GrossProfit"],
     "operating_income": ["OperatingIncomeLoss"],
@@ -155,10 +159,12 @@ def extract_factors(facts: dict | None) -> dict:
         "gross_margin": None, "gross_margin_trend": None,
         "operating_margin": None, "operating_margin_trend": None,
         "roe": None,
+        "roic": None,
         "debt_to_equity": None,
         "share_change": None,
         "net_income_latest": None,
         "revenue_latest": None,
+        "shares_latest": None,
     }
     if not facts:
         return out
@@ -171,6 +177,7 @@ def extract_factors(facts: dict | None) -> dict:
     ltd = _series_for_concept(facts, "total_debt")
     cd = _series_for_concept(facts, "current_debt")
     sh = _series_for_concept(facts, "shares_outstanding")
+    cash = _series_for_concept(facts, "cash")
 
     # --- Growth ---
     out["revenue_cagr"] = _cagr(rev)
@@ -197,9 +204,24 @@ def extract_factors(facts: dict | None) -> dict:
     out["net_income_latest"] = _latest(ni)
     out["roe"] = _ratio(_latest(ni), _latest(eq))
 
+    # --- Quality: ROIC = NOPAT / Invested Capital ---
+    # NOPAT ~= operating income * (1 - statutory tax 21%); a standard
+    # approximation when we don't compute an effective rate per company.
+    # Invested capital ~= total debt + equity - cash (common definition).
+    oi_latest = _latest(oi)
+    eq_latest = _latest(eq)
+    cash_latest = _latest(cash)
+    debt_l = _latest(ltd)
+    cdebt_l = _latest(cd)
+    if oi_latest is not None and eq_latest is not None:
+        nopat = oi_latest * (1 - 0.21)
+        total_debt = (debt_l or 0) + (cdebt_l or 0)
+        invested_capital = total_debt + eq_latest - (cash_latest or 0)
+        out["roic"] = _ratio(nopat, invested_capital)
+
     # --- Balance sheet: debt/equity (sum LT + current debt if both present) ---
-    debt_latest = _latest(ltd)
-    cdebt_latest = _latest(cd)
+    debt_latest = debt_l
+    cdebt_latest = cdebt_l
     if debt_latest is not None or cdebt_latest is not None:
         total_debt = (debt_latest or 0) + (cdebt_latest or 0)
         out["debt_to_equity"] = _ratio(total_debt, _latest(eq))
@@ -207,5 +229,6 @@ def extract_factors(facts: dict | None) -> dict:
     # --- Balance sheet: share count change (dilution) over full series ---
     # Positive = dilution (more shares), negative = buybacks.
     out["share_change"] = _cagr(sh)  # CAGR of share count
+    out["shares_latest"] = _latest(sh)  # for market-cap computation
 
     return out
