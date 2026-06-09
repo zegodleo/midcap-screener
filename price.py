@@ -1,97 +1,138 @@
 """
-Phase 2 — Price enrichment via Stooq (free, no blocking, no limits)
-===================================================================
+Phase 2 — Scoring engine
+========================
 
-Replaces yfinance, which Yahoo blocks from cloud IPs (GitHub Actions). Stooq
-serves a simple CSV quote endpoint that does not block datacenter traffic and
-has no rate caps.
+Takes the per-company factor dicts (from factors.py) plus optional price-based
+factors, normalizes each factor to 0-100 across the universe (percentile rank),
+applies bucket weights, and produces a final score + a COVERAGE figure.
 
-Stooq gives price + volume (not market cap directly), so we COMPUTE:
-  market_cap   = close_price * shares_outstanding   (shares from EDGAR)
-  price_to_sales = market_cap / latest_annual_revenue (revenue from EDGAR)
-  dollar_volume  = close_price * daily_volume
+Why percentile-rank normalization:
+  - Robust to outliers and to factors on wildly different scales (a margin is
+    0-1, market cap is billions). Each company is scored by where it ranks vs
+    peers, 0 (worst) to 100 (best).
+  - For factors where "lower is better" (debt, dilution, valuation multiple),
+    we invert so high score always = more attractive.
 
-This is more robust than yfinance: two solid sources (Stooq price + EDGAR
-fundamentals) instead of one flaky scraper. Still fully defensive — any failure
-leaves that company's price factors as None, handled by the coverage system.
+Coverage:
+  - Each factor a company actually has contributes to its coverage count.
+  - The final score is the weighted average over the buckets it HAS data for,
+    and we report coverage so thin-data companies can be flagged/excluded.
 """
 
 from __future__ import annotations
-import csv
-import io
-import logging
-import time
+import pandas as pd
 
-import requests
+# Factor -> (bucket, higher_is_better)
+# Buckets and weights:
+BUCKET_WEIGHTS = {
+    "growth": 0.35,
+    "quality": 0.25,
+    "balance": 0.15,
+    "valuation": 0.10,
+    "size": 0.10,
+    "liquidity": 0.05,
+}
 
-log = logging.getLogger("price")
-
-STOOQ_URL = "https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
-
-
-def _to_stooq_symbol(ticker: str) -> str:
-    """AAPL -> AAPL.US ; MOG.A -> MOG-A.US (Stooq uses dashes + .US suffix)."""
-    return ticker.replace(".", "-").upper() + ".US"
-
-
-def _fetch_quote(session: requests.Session, ticker: str) -> tuple | None:
-    """Return (close, volume) for a ticker, or None if unavailable."""
-    url = STOOQ_URL.format(sym=_to_stooq_symbol(ticker))
-    try:
-        resp = session.get(url, timeout=20)
-        resp.raise_for_status()
-        rows = list(csv.DictReader(io.StringIO(resp.text)))
-        if not rows:
-            return None
-        row = rows[0]
-        close_raw = row.get("Close", "")
-        vol_raw = row.get("Volume", "")
-        if close_raw in ("", "N/D", None):
-            return None
-        close = float(close_raw)
-        vol = float(vol_raw) if vol_raw not in ("", "N/D", None) else None
-        return close, vol
-    except Exception as e:  # noqa: BLE001 - never let price kill the run
-        log.debug("Stooq lookup failed for %s: %s", ticker, e)
-        return None
+# Each factor maps to a bucket and a direction.
+# higher_is_better=False means we invert the percentile (low raw = high score).
+FACTOR_SPEC = {
+    # growth
+    "revenue_cagr":           ("growth", True),
+    "revenue_yoy":            ("growth", True),
+    # quality
+    "gross_margin":           ("quality", True),
+    "gross_margin_trend":     ("quality", True),
+    "operating_margin":       ("quality", True),
+    "operating_margin_trend": ("quality", True),
+    "roe":                    ("quality", True),
+    "roic":                   ("quality", True),
+    # balance sheet
+    "debt_to_equity":         ("balance", False),   # lower is better
+    "share_change":           ("balance", False),   # lower (less dilution) better
+    # valuation (price-dependent; added by enrichment)
+    "price_to_sales":         ("valuation", False), # lower is better
+    # size (price-dependent)
+    "market_cap":             ("size", True),       # bigger within the band
+    # liquidity (price-dependent)
+    "dollar_volume":          ("liquidity", True),
+}
 
 
-def enrich_with_price(rows: list[dict], pause: float = 0.05) -> list[dict]:
+def _percentile_scores(s: pd.Series, higher_is_better: bool) -> pd.Series:
+    """Rank a factor column to 0-100 percentile. NaNs stay NaN (no data)."""
+    pct = s.rank(pct=True) * 100.0
+    if not higher_is_better:
+        pct = 100.0 - pct
+    return pct
+
+
+def score_universe(rows: list[dict]) -> pd.DataFrame:
     """
-    Attach market_cap, price_to_sales, dollar_volume to each row.
-    Needs 'ticker', and from EDGAR: 'shares_latest' and 'revenue_latest'.
-    Missing/failed lookups leave price factors as None.
+    rows: list of dicts, each = {ticker, company, sector, ...all factors...}.
+    Returns a DataFrame with per-factor scores, per-bucket scores, a final
+    'score' (0-100), and 'coverage' (# of factors with data, out of total).
     """
-    for r in rows:
-        r.setdefault("market_cap", None)
-        r.setdefault("price_to_sales", None)
-        r.setdefault("dollar_volume", None)
+    df = pd.DataFrame(rows)
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "MidCapScreener research"})
-
-    got = 0
-    for r in rows:
-        ticker = r.get("ticker")
-        if not ticker:
+    # 1) Normalize each available factor to a 0-100 score column.
+    score_cols_by_bucket: dict[str, list[str]] = {b: [] for b in BUCKET_WEIGHTS}
+    for factor, (bucket, hib) in FACTOR_SPEC.items():
+        if factor not in df.columns:
             continue
-        quote = _fetch_quote(session, ticker)
-        time.sleep(pause)
-        if quote is None:
-            continue
-        close, vol = quote
-        shares = r.get("shares_latest")
-        rev = r.get("revenue_latest")
+        col = f"score__{factor}"
+        df[col] = _percentile_scores(pd.to_numeric(df[factor], errors="coerce"), hib)
+        score_cols_by_bucket[bucket].append(col)
 
-        if shares and shares > 0:
-            mcap = close * shares
-            r["market_cap"] = mcap
-            got += 1
-            if rev and rev > 0:
-                r["price_to_sales"] = mcap / rev
-        if vol:
-            r["dollar_volume"] = close * vol
+    # 2) Bucket score = mean of available factor-scores in that bucket.
+    bucket_score_cols = []
+    for bucket, cols in score_cols_by_bucket.items():
+        bcol = f"bucket__{bucket}"
+        if cols:
+            df[bcol] = df[cols].mean(axis=1, skipna=True)
+        else:
+            df[bcol] = pd.NA
+        bucket_score_cols.append((bucket, bcol))
 
-    log.info("Price enrichment (Stooq): %d/%d tickers got market cap.",
-             got, len(rows))
-    return rows
+    # 3) Final score = weighted avg over buckets that HAVE a score, with the
+    #    weights renormalized to the available buckets. BUT a company must meet
+    #    a minimum data-coverage bar to receive a ranked score — otherwise a
+    #    name with only one bucket could top the table on thin data (exactly
+    #    the failure mode coverage exists to prevent). Below the bar, the score
+    #    is still computed but the company is marked low-confidence and sorted
+    #    below all sufficiently-covered names.
+    MIN_WEIGHT_COVERAGE = 0.60  # must have buckets totaling >=60% of weight
+
+    def final_row(r):
+        num, wsum = 0.0, 0.0
+        for bucket, bcol in bucket_score_cols:
+            v = r[bcol]
+            if pd.notna(v):
+                w = BUCKET_WEIGHTS[bucket]
+                num += v * w
+                wsum += w
+        return num / wsum if wsum > 0 else pd.NA
+    df["score"] = df.apply(final_row, axis=1)
+
+    # 4) Coverage: how many of the defined factors this company actually had.
+    factor_cols = [f for f in FACTOR_SPEC if f in df.columns]
+    df["coverage"] = df[factor_cols].notna().sum(axis=1)
+    df["coverage_max"] = len(factor_cols)
+    # weight-coverage: fraction of total bucket weight that was available
+    def weight_cov(r):
+        return sum(BUCKET_WEIGHTS[b] for b, bcol in bucket_score_cols
+                   if pd.notna(r[bcol]))
+    df["weight_coverage"] = df.apply(weight_cov, axis=1)
+
+    # Confidence flag: did the company clear the coverage bar?
+    df["sufficient_data"] = df["weight_coverage"] >= MIN_WEIGHT_COVERAGE
+
+    # Sort: well-covered names first (by score), then low-confidence names
+    # (by score) below them — so thin data can never top the ranking.
+    df = df.sort_values(
+        ["sufficient_data", "score"],
+        ascending=[False, False],
+        na_position="last",
+    )
+    df = df.reset_index(drop=True)
+    df.insert(0, "rank", df.index + 1)
+    return df
