@@ -1,126 +1,131 @@
 """
-Phase 2 — Main orchestration (run this)
-=======================================
+Phase 2 — Scoring engine
+========================
 
-Pipeline:
-  1. Build the universe (Phase 1): S&P 400 + CIKs.
-  2. For each company, fetch EDGAR CompanyFacts and extract fundamental factors.
-  3. (Optional) enrich with price via yfinance for valuation/size/liquidity.
-  4. Score & rank, tracking coverage.
-  5. Write outputs: ranked CSV (all) + a top-N CSV.
+Takes the per-company factor dicts (from factors.py) plus optional price-based
+factors, normalizes each factor to 0-100 across the universe (percentile rank),
+applies bucket weights, and produces a final score + a COVERAGE figure.
 
-Runs unattended in GitHub Actions. EDGAR is the backbone (no limits); price is
-best-effort. Designed to finish a 400-name universe in a few minutes.
+Why percentile-rank normalization:
+  - Robust to outliers and to factors on wildly different scales (a margin is
+    0-1, market cap is billions). Each company is scored by where it ranks vs
+    peers, 0 (worst) to 100 (best).
+  - For factors where "lower is better" (debt, dilution, valuation multiple),
+    we invert so high score always = more attractive.
+
+Coverage:
+  - Each factor a company actually has contributes to its coverage count.
+  - The final score is the weighted average over the buckets it HAS data for,
+    and we report coverage so thin-data companies can be flagged/excluded.
 """
 
 from __future__ import annotations
-import os
-import logging
-
 import pandas as pd
 
-from universe import SecClient, build_universe, fetch_company_facts
-from factors import extract_factors
-from price import enrich_with_price
-from scoring import score_universe
+# Buckets and weights — FUNDAMENTALS-ONLY (price sources unavailable in 2026).
+# Valuation/Size/Liquidity needed live price; keyless price scraping is dead
+# (yfinance + Stooq both blocked). The remaining weights are renormalized to
+# sum to 1.0. Valuation is now a MANUAL step on your shortlist, not scored.
+BUCKET_WEIGHTS = {
+    "growth": 0.467,    # was 0.35  -> 0.35/0.75
+    "quality": 0.333,   # was 0.25  -> 0.25/0.75
+    "balance": 0.200,   # was 0.15  -> 0.15/0.75
+}
 
-log = logging.getLogger("screen")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Each factor maps to a bucket and a direction.
+# higher_is_better=False means we invert the percentile (low raw = high score).
+FACTOR_SPEC = {
+    # growth
+    "revenue_cagr":           ("growth", True),
+    "revenue_yoy":            ("growth", True),
+    # quality
+    "gross_margin":           ("quality", True),
+    "gross_margin_trend":     ("quality", True),
+    "operating_margin":       ("quality", True),
+    "operating_margin_trend": ("quality", True),
+    "roe":                    ("quality", True),
+    "roic":                   ("quality", True),
+    # balance sheet
+    "debt_to_equity":         ("balance", False),   # lower is better
+    "share_change":           ("balance", False),   # lower (less dilution) better
+}
 
 
+def _percentile_scores(s: pd.Series, higher_is_better: bool) -> pd.Series:
+    """Rank a factor column to 0-100 percentile. NaNs stay NaN (no data)."""
+    pct = s.rank(pct=True) * 100.0
+    if not higher_is_better:
+        pct = 100.0 - pct
+    return pct
 
-def run() -> pd.DataFrame:
-    top_n = int(os.environ.get("TOP_N", "50"))
-    skip_price = os.environ.get("SKIP_PRICE", "").lower() in ("1", "true", "yes")
-    client = SecClient()
 
-    # --- Phase 1: universe ---
-    uni = build_universe(client)
-    universe = uni.df[uni.df["cik"].notna()].copy()
+def score_universe(rows: list[dict]) -> pd.DataFrame:
+    """
+    rows: list of dicts, each = {ticker, company, sector, ...all factors...}.
+    Returns a DataFrame with per-factor scores, per-bucket scores, a final
+    'score' (0-100), and 'coverage' (# of factors with data, out of total).
+    """
+    df = pd.DataFrame(rows)
 
-    # Exclude sectors that don't fit a growth-compounder model. Banks have no
-    # gross margin and REITs are valued on NAV/book, not revenue growth and
-    # margins — scoring them on this rubric is meaningless. They need a
-    # separate scorecard, so we leave them out of this screen entirely.
-    EXCLUDED_SECTORS = {"Financials", "Real Estate"}
-    before = len(universe)
-    universe = universe[~universe["sector"].isin(EXCLUDED_SECTORS)].copy()
-    log.info("Excluded %d Financials/Real Estate; %d companies remain.",
-             before - len(universe), len(universe))
-    log.info("Scoring %d companies with CIKs.", len(universe))
+    # 1) Normalize each available factor to a 0-100 score column.
+    score_cols_by_bucket: dict[str, list[str]] = {b: [] for b in BUCKET_WEIGHTS}
+    for factor, (bucket, hib) in FACTOR_SPEC.items():
+        if factor not in df.columns:
+            continue
+        col = f"score__{factor}"
+        df[col] = _percentile_scores(pd.to_numeric(df[factor], errors="coerce"), hib)
+        score_cols_by_bucket[bucket].append(col)
 
-    # --- Phase 2a: per-company EDGAR factors ---
-    rows: list[dict] = []
-    total = len(universe)
-    for i, rec in enumerate(universe.itertuples(index=False), start=1):
-        if i % 50 == 0 or i == 1:
-            log.info("Fetching EDGAR facts %d/%d ...", i, total)
-        facts = fetch_company_facts(client, rec.cik)
-        f = extract_factors(facts)
-        f.update({
-            "ticker": rec.ticker,
-            "company": rec.company,
-            "sector": rec.sector,
-            "cik": rec.cik,
-        })
-        rows.append(f)
+    # 2) Bucket score = mean of available factor-scores in that bucket.
+    bucket_score_cols = []
+    for bucket, cols in score_cols_by_bucket.items():
+        bcol = f"bucket__{bucket}"
+        if cols:
+            df[bcol] = df[cols].mean(axis=1, skipna=True)
+        else:
+            df[bcol] = pd.NA
+        bucket_score_cols.append((bucket, bcol))
 
-    # --- Phase 2b: optional price enrichment ---
-    if skip_price:
-        log.info("SKIP_PRICE set; running on fundamentals only.")
-        for r in rows:
-            r.setdefault("market_cap", None)
-            r.setdefault("price_to_sales", None)
-            r.setdefault("dollar_volume", None)
-    else:
-        log.info("Enriching with price (Stooq)...")
-        rows = enrich_with_price(rows)
+    # 3) Final score = weighted avg over buckets that HAVE a score, with the
+    #    weights renormalized to the available buckets. BUT a company must meet
+    #    a minimum data-coverage bar to receive a ranked score — otherwise a
+    #    name with only one bucket could top the table on thin data (exactly
+    #    the failure mode coverage exists to prevent). Below the bar, the score
+    #    is still computed but the company is marked low-confidence and sorted
+    #    below all sufficiently-covered names.
+    MIN_WEIGHT_COVERAGE = 0.60  # must have buckets totaling >=60% of weight
 
-    # --- Phase 2c: score & rank ---
-    df = score_universe(rows)
+    def final_row(r):
+        num, wsum = 0.0, 0.0
+        for bucket, bcol in bucket_score_cols:
+            v = r[bcol]
+            if pd.notna(v):
+                w = BUCKET_WEIGHTS[bucket]
+                num += v * w
+                wsum += w
+        return num / wsum if wsum > 0 else pd.NA
+    df["score"] = df.apply(final_row, axis=1)
 
-    # Tidy column order for the human-readable output
-    front = ["rank", "ticker", "company", "sector", "score",
-             "sufficient_data", "coverage", "coverage_max", "weight_coverage"]
-    factor_cols = ["revenue_cagr", "revenue_yoy", "revenue_years",
-                   "gross_margin", "gross_margin_trend",
-                   "operating_margin", "operating_margin_trend", "roe", "roic",
-                   "debt_to_equity", "share_change",
-                   "price_to_sales", "market_cap", "dollar_volume"]
-    front += [c for c in factor_cols if c in df.columns]
-    ordered = front + [c for c in df.columns if c not in front]
-    df = df[ordered]
+    # 4) Coverage: how many of the defined factors this company actually had.
+    factor_cols = [f for f in FACTOR_SPEC if f in df.columns]
+    df["coverage"] = df[factor_cols].notna().sum(axis=1)
+    df["coverage_max"] = len(factor_cols)
+    # weight-coverage: fraction of total bucket weight that was available
+    def weight_cov(r):
+        return sum(BUCKET_WEIGHTS[b] for b, bcol in bucket_score_cols
+                   if pd.notna(r[bcol]))
+    df["weight_coverage"] = df.apply(weight_cov, axis=1)
 
-    # --- Outputs ---
-    out_dir = os.environ.get("OUTPUT_DIR", "output")
-    os.makedirs(out_dir, exist_ok=True)
-    all_path = os.path.join(out_dir, "scored_all.csv")
-    top_path = os.path.join(out_dir, f"top{top_n}.csv")
-    df.to_csv(all_path, index=False)
-    # Top-N drawn only from sufficiently-covered names
-    top = df[df["sufficient_data"]].head(top_n)
-    top.to_csv(top_path, index=False)
+    # Confidence flag: did the company clear the coverage bar?
+    df["sufficient_data"] = df["weight_coverage"] >= MIN_WEIGHT_COVERAGE
 
-    log.info("=" * 60)
-    log.info("Phase 2 complete.")
-    log.info("  Companies scored        : %d", len(df))
-    log.info("  Sufficient data (ranked): %d", int(df["sufficient_data"].sum()))
-    log.info("  All results  -> %s", all_path)
-    log.info("  Top %-2d       -> %s", top_n, top_path)
-    log.info("=" * 60)
-    if len(top):
-        log.info("Top 10 preview:")
-        for rec in top.head(10).itertuples(index=False):
-            cagr = "" if pd.isna(rec.revenue_cagr) else f"{rec.revenue_cagr*100:5.1f}%"
-            log.info("  #%-2d %-6s score=%5.1f  rev_cagr=%6s  cov=%d/%d",
-                     rec.rank, rec.ticker, rec.score, cagr,
-                     rec.coverage, rec.coverage_max)
+    # Sort: well-covered names first (by score), then low-confidence names
+    # (by score) below them — so thin data can never top the ranking.
+    df = df.sort_values(
+        ["sufficient_data", "score"],
+        ascending=[False, False],
+        na_position="last",
+    )
+    df = df.reset_index(drop=True)
+    df.insert(0, "rank", df.index + 1)
     return df
-
-
-if __name__ == "__main__":
-    run()
