@@ -173,7 +173,16 @@ def build_universe(client: SecClient) -> Universe:
     sp400 = load_sp400(client)
     cik_map = load_cik_map(client)
 
-    sp400["cik"] = sp400["ticker"].map(cik_map)
+    def resolve_cik(ticker: str) -> str | None:
+        t = ticker.upper().strip()
+        if t in cik_map:
+            return cik_map[t]
+        # Share-class fallback: index lists use dots (MOG.A), EDGAR uses
+        # hyphens (MOG-A). Try the hyphenated form before giving up.
+        alt = t.replace(".", "-")
+        return cik_map.get(alt)
+
+    sp400["cik"] = sp400["ticker"].apply(resolve_cik)
     matched = sp400["cik"].notna().sum()
     unmatched = sp400.loc[sp400["cik"].isna(), "ticker"].tolist()
 
