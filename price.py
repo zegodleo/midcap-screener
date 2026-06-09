@@ -1,77 +1,97 @@
 """
-Phase 2 — Price enrichment (optional, defensive)
-=================================================
+Phase 2 — Price enrichment via Stooq (free, no blocking, no limits)
+===================================================================
 
-Adds price-dependent factors: market_cap, price_to_sales, dollar_volume.
+Replaces yfinance, which Yahoo blocks from cloud IPs (GitHub Actions). Stooq
+serves a simple CSV quote endpoint that does not block datacenter traffic and
+has no rate caps.
 
-CRITICAL DESIGN RULE: this is the ONE flaky data source in the stack.
-yfinance is an unofficial Yahoo scraper that can break or get rate-limited
-(especially from cloud IPs like GitHub Actions). So:
-  - It NEVER raises into the main pipeline. Any failure -> that company's
-    price factors are None, which the coverage system handles honestly.
-  - The EDGAR fundamental score (the other 90%) is unaffected by price gaps.
+Stooq gives price + volume (not market cap directly), so we COMPUTE:
+  market_cap   = close_price * shares_outstanding   (shares from EDGAR)
+  price_to_sales = market_cap / latest_annual_revenue (revenue from EDGAR)
+  dollar_volume  = close_price * daily_volume
 
-If yfinance is unavailable entirely, the whole enrichment is skipped and the
-screen runs on fundamentals alone.
+This is more robust than yfinance: two solid sources (Stooq price + EDGAR
+fundamentals) instead of one flaky scraper. Still fully defensive — any failure
+leaves that company's price factors as None, handled by the coverage system.
 """
 
 from __future__ import annotations
+import csv
+import io
 import logging
 import time
 
+import requests
+
 log = logging.getLogger("price")
 
-try:
-    import yfinance as yf
-    _HAS_YF = True
-except ImportError:
-    _HAS_YF = False
-    log.warning("yfinance not installed; price factors will be skipped.")
+STOOQ_URL = "https://stooq.com/q/l/?s={sym}&f=sd2t2ohlcv&h&e=csv"
 
 
-def enrich_with_price(rows: list[dict], pause: float = 0.3) -> list[dict]:
+def _to_stooq_symbol(ticker: str) -> str:
+    """AAPL -> AAPL.US ; MOG.A -> MOG-A.US (Stooq uses dashes + .US suffix)."""
+    return ticker.replace(".", "-").upper() + ".US"
+
+
+def _fetch_quote(session: requests.Session, ticker: str) -> tuple | None:
+    """Return (close, volume) for a ticker, or None if unavailable."""
+    url = STOOQ_URL.format(sym=_to_stooq_symbol(ticker))
+    try:
+        resp = session.get(url, timeout=20)
+        resp.raise_for_status()
+        rows = list(csv.DictReader(io.StringIO(resp.text)))
+        if not rows:
+            return None
+        row = rows[0]
+        close_raw = row.get("Close", "")
+        vol_raw = row.get("Volume", "")
+        if close_raw in ("", "N/D", None):
+            return None
+        close = float(close_raw)
+        vol = float(vol_raw) if vol_raw not in ("", "N/D", None) else None
+        return close, vol
+    except Exception as e:  # noqa: BLE001 - never let price kill the run
+        log.debug("Stooq lookup failed for %s: %s", ticker, e)
+        return None
+
+
+def enrich_with_price(rows: list[dict], pause: float = 0.05) -> list[dict]:
     """
-    For each row (must have 'ticker' and ideally 'revenue_latest'), attach:
-      market_cap, price_to_sales, dollar_volume.
-    Missing/failed lookups leave these as None. Mutates and returns rows.
+    Attach market_cap, price_to_sales, dollar_volume to each row.
+    Needs 'ticker', and from EDGAR: 'shares_latest' and 'revenue_latest'.
+    Missing/failed lookups leave price factors as None.
     """
     for r in rows:
         r.setdefault("market_cap", None)
         r.setdefault("price_to_sales", None)
         r.setdefault("dollar_volume", None)
 
-    if not _HAS_YF:
-        return rows
+    session = requests.Session()
+    session.headers.update({"User-Agent": "MidCapScreener research"})
 
+    got = 0
     for r in rows:
         ticker = r.get("ticker")
         if not ticker:
             continue
-        try:
-            # EDGAR uses MOG-A; yfinance wants MOG-A too (it accepts hyphens),
-            # but some feeds prefer dots. Try as-is first.
-            t = yf.Ticker(ticker)
-            fi = getattr(t, "fast_info", None) or {}
+        quote = _fetch_quote(session, ticker)
+        time.sleep(pause)
+        if quote is None:
+            continue
+        close, vol = quote
+        shares = r.get("shares_latest")
+        rev = r.get("revenue_latest")
 
-            price = fi.get("last_price") if hasattr(fi, "get") else None
-            mcap = fi.get("market_cap") if hasattr(fi, "get") else None
-            vol = fi.get("last_volume") if hasattr(fi, "get") else None
+        if shares and shares > 0:
+            mcap = close * shares
+            r["market_cap"] = mcap
+            got += 1
+            if rev and rev > 0:
+                r["price_to_sales"] = mcap / rev
+        if vol:
+            r["dollar_volume"] = close * vol
 
-            if mcap:
-                r["market_cap"] = float(mcap)
-            if price and vol:
-                r["dollar_volume"] = float(price) * float(vol)
-
-            # price/sales = market cap / latest annual revenue (from EDGAR)
-            rev = r.get("revenue_latest")
-            if mcap and rev and rev > 0:
-                r["price_to_sales"] = float(mcap) / float(rev)
-
-        except Exception as e:  # noqa: BLE001 - never let price kill the run
-            log.debug("price lookup failed for %s: %s", ticker, e)
-        finally:
-            time.sleep(pause)  # be gentle; reduces Yahoo throttling
-
-    got = sum(1 for r in rows if r.get("market_cap") is not None)
-    log.info("Price enrichment: %d/%d tickers got market cap.", got, len(rows))
+    log.info("Price enrichment (Stooq): %d/%d tickers got market cap.",
+             got, len(rows))
     return rows
