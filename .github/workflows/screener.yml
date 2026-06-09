@@ -24,7 +24,7 @@ jobs:
           # Set this in: repo Settings -> Secrets and variables -> Actions
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
           OUTPUT_DIR: output
-        run: python screener/universe.py
+        run: python universe.py
 
       - name: Commit results
         run: |
